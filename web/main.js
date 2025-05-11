@@ -125,8 +125,11 @@ function join(){
   cvs.style.pointerEvents="auto";
   cvs.focus();
 
-  const proto = location.protocol==="https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+const proto = location.protocol === "https:" ? "wss" : "ws";
+const wsUrl  = `${proto}://${location.host}/ws`;
+// a jeśli front i back są na różnych domenach:
+// const wsUrl = `${proto}://your-project.up.railway.app/ws`;
+ws = new WebSocket(wsUrl);
 
   ws.addEventListener("open", () => {
     // wysyłamy nick + startujemy heartbeat
