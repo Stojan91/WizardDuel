@@ -2,7 +2,7 @@
 import os, random, asyncio
 from aiohttp import web, WSMsgType
 
-HOST, PORT    = '0.0.0.0', 8080
+HOST, PORT    = '0.0.0.0', 5000
 WIDTH, HEIGHT = 800, 600
 BOAT_SIZE     = 64
 MIN_Y         = HEIGHT // 2 + 20          # łodzie i ryby w dolnej połowie
