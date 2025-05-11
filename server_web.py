@@ -16,7 +16,7 @@ import numpy as np
 import os
 
 ROOT        = pathlib.Path(__file__).parent
-PORT        = int(os.getenv("PORT", 8080))  # Railway tu ustawia port
+PORT        = int(os.getenv("PORT", 5000))  # Railway tu ustawia port
 TICK       = 1/30
 AFK_LIMIT  = 60
 PLAYER_R   = 6

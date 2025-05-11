@@ -1,6 +1,17 @@
-FROM python:3.11-slim
+# Dockerfile
+FROM python:3.9-slim
+
 WORKDIR /app
-COPY server_web.py assets/ requirements.txt ./
-RUN pip install websockets pillow numpy
-EXPOSE 8080
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# Copy project files
+COPY . .
+
+# Expose the correct port
+EXPOSE 5000
+
+# Run the application
 CMD ["python", "server_web.py"]
