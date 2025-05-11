@@ -63,7 +63,7 @@ async def tick():
             if fb.x<0 or fb.x>WIDTH or fb.y<0 or fb.y>HEIGHT: fireballs.remove(fb); continue
             for pl in players.values():
                 if pl.id==fb.owner or pl.hp<=0: continue
-		 print("broadcast", len(players), "players,", len(fireballs), "fireballs")
+         print("broadcast", len(players), "players,", len(fireballs), "fireballs")
                 if (pl.x-fb.x)**2 + (pl.y-fb.y)**2 < 12**2: pl.hp -= 1; fireballs.remove(fb); break
         await broadcast({})
         await asyncio.sleep(1/TICK_HZ)
