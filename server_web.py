@@ -1,195 +1,118 @@
 #!/usr/bin/env python3
-# coding: utf-8
-"""
-Wizard Duel – serwer HTTP + WebSocket
-• 6 px hit-box → węższe korytarze
-• wymagany, unikalny nick
-• AFK-kick after 60 s + ping support
-• ignorowanie query-string (?fbclid…)
-• HTTP router → zawsze index.html (żadnej strony ngrok)
-"""
-import asyncio, json, pathlib, random, time, websockets, mimetypes
-from http import HTTPStatus
-from urllib.parse import urlsplit
-from PIL import Image
-import numpy as np
-import os
+import os, random, asyncio
+from aiohttp import web, WSMsgType
 
-ROOT        = pathlib.Path(__file__).parent
-PORT        = int(os.getenv("PORT", 5000))  # Railway tu ustawia port
-TICK       = 1/30
-AFK_LIMIT  = 60
-PLAYER_R   = 6
-FIREBALL_R = 8
-BALL_SPEED = 10
-MAX_HP     = 5
+HOST, PORT    = '0.0.0.0', 8080
+WIDTH, HEIGHT = 800, 600
+BOAT_SIZE     = 64
+MIN_Y         = HEIGHT // 2 + 20          # łodzie i ryby w dolnej połowie
+MAX_Y         = HEIGHT - BOAT_SIZE
+FPS           = 60
+CHAT_DUR      = FPS * 5
 
-# ── mapa + kolizje ─────────────────────────────────────────────────────────
-MAP_IMG  = (Image.open(ROOT/"assets/mapa.png")
-              .convert("L")
-              .resize((800,600),Image.NEAREST))
-PASSABLE = np.array(MAP_IMG) > 128
+rooms = {}                                  # nazwa → Room()
 
-def passable(x:int,y:int,r:int=PLAYER_R)->bool:
-    for dx,dy in [(0,0),(r,0),(-r,0),(0,r),(0,-r),(r,r),(-r,r),(r,-r),(-r,-r)]:
-        ix,iy = int(x+dx), int(y+dy)
-        if ix<0 or iy<0 or ix>=800 or iy>=600 or not PASSABLE[iy,ix]:
-            return False
-    return True
 
-def random_xy():
-    while True:
-        x=random.randint(PLAYER_R,800-PLAYER_R)
-        y=random.randint(PLAYER_R,600-PLAYER_R)
-        if passable(x,y): return x,y
+class Room:
+    def __init__(self):
+        self.players, self.fish, self.sockets = {}, [], set()
+        self.respawn_fish()
 
-# ── stan gry ───────────────────────────────────────────────────────────────
-players   = {}    # pid → Player
-fireballs = []    # list of dict
-clients   = {}    # ws → pid
-nick_set  = set() # wszystkie nazwy
+    def respawn_fish(self):
+        self.fish = []
+        for _ in range(5):
+            size = random.choice([64, 96])
+            self.fish.append({
+                'x': random.randrange(0, WIDTH - size),
+                'y': random.randrange(MIN_Y, MAX_Y - size),
+                'size': size,
+                'speed': random.choice([2, 3, 4]),
+                'dir': random.choice([-1, 1])
+            })
 
-class Player:
-    def __init__(self,pid,nick):
-        self.id          = pid
-        self.nick        = nick
-        self.x,self.y    = random_xy()
-        self.hp          = MAX_HP
-        self.say         = None
-        self.last_active = time.time()
-    def as_dict(self):
-        return {"x":self.x,"y":self.y,"hp":self.hp,
-                "nick":self.nick,"say":self.say}
-    def touch(self):
-        self.last_active = time.time()
+    def update(self):
+        for f in self.fish:
+            f['x'] += f['speed'] * f['dir']
+            if f['x'] < 0 or f['x'] > WIDTH - f['size']:
+                f['dir'] *= -1
+        for p in self.players.values():
+            if 'chat' in p:
+                p['chat']['timer'] -= 1
+                if p['chat']['timer'] <= 0:
+                    del p['chat']
 
-# ── WebSocket handler ─────────────────────────────────────────────────────
-async def ws_handler(ws):
-    pid = str(id(ws))
-    try:
-        hello = json.loads(await asyncio.wait_for(ws.recv(),10))
-    except:
-        await ws.close(); return
+    def dump(self):
+        return {'action': 'state', 'fish': self.fish, 'players': self.players}
 
-    nick = str(hello.get("nick","")).strip()
-    if not nick:
-        await ws.send(json.dumps({"error":"empty-nick"}))
-        await ws.close(); return
-    if nick in nick_set:
-        await ws.send(json.dumps({"error":"nick-taken"}))
-        await ws.close(); return
 
-    p = Player(pid,nick)
-    players[pid] = p
-    clients[ws]  = pid
-    nick_set.add(nick)
+async def ws_handler(request):
+    ws = web.WebSocketResponse(); await ws.prepare(request)
 
-    await ws.send(json.dumps({"you":pid}))
-    await broadcast()
+    hello = await ws.receive_json()
+    if hello.get('action') != 'join':
+        await ws.close(); return ws
+
+    room_name = hello['room']; player = hello['player_name']
+    room = rooms.setdefault(room_name, Room())
+    room.players[player] = {'x': WIDTH//2-BOAT_SIZE//2, 'y': MIN_Y, 'score': 0}
+    room.sockets.add(ws)
+    await ws.send_json(room.dump())
 
     try:
-        async for raw in ws:
-            data = json.loads(raw)
-            if "ping" in data:
-                p.touch(); continue
-            p.touch()
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT: continue
+            data = msg.json(); act = data.get('action')
 
-            if "x" in data and "y" in data:
-                nx,ny = data["x"],data["y"]
-                if passable(nx,ny): p.x,p.y = nx,ny
+            if act == 'move':
+                px = max(0, min(WIDTH-BOAT_SIZE, data.get('x', 0)))
+                py = max(MIN_Y, min(MAX_Y,      data.get('y', MIN_Y)))
+                room.players[player]['x'], room.players[player]['y'] = px, py
 
-            if "shoot" in data:
-                d = data["shoot"]
-                dx,dy = float(d.get("dx",0)), float(d.get("dy",-1))
-                n = (dx*dx+dy*dy)**0.5 or 1
-                fireballs.append({
-                    "x":p.x,"y":p.y,
-                    "vx":BALL_SPEED*dx/n,"vy":BALL_SPEED*dy/n,
-                    "owner":pid
-                })
+            elif act == 'catch':
+                b = room.players[player]
+                caught = [i for i,f in enumerate(room.fish)
+                          if (f['x'] < b['x']+BOAT_SIZE and f['x']+f['size'] > b['x'] and
+                              f['y'] < b['y']+BOAT_SIZE and f['y']+f['size'] > b['y'])]
+                for i in reversed(caught): room.fish.pop(i); room.players[player]['score'] += 1
+                if not room.fish: room.respawn_fish()
 
-            if "chat" in data:
-                txt = str(data["chat"])[:100]
-                p.say = {"text":txt,"time":time.time()*1000}
-                await chat_broadcast(p.nick,txt)
-                await broadcast()
+            elif act == 'chat':
+                txt = data.get('text','').strip()
+                if txt: room.players[player]['chat'] = {'text': txt, 'timer': CHAT_DUR}
 
-    except websockets.ConnectionClosed:
-        pass
+            state = room.dump()
+            for cli in set(room.sockets): await cli.send_json(state)
     finally:
-        # cleanup
-        _=players.pop(pid,None)
-        nick_set.discard(nick)
-        for w,uid in list(clients.items()):
-            if uid==pid: clients.pop(w,None)
+        room.sockets.discard(ws); room.players.pop(player, None)
+        if not room.players: rooms.pop(room_name, None)   # <-- usuń pusty pokój
+    return ws
 
-async def chat_broadcast(nick,text):
-    msg = json.dumps({"chat":{"nick":nick,"text":text}})
-    await asyncio.gather(*(w.send(msg) for w in clients))
 
-async def broadcast():
-    snap = json.dumps({
-        "players": {pid:p.as_dict() for pid,p in players.items()},
-        "fireballs": fireballs
-    })
-    await asyncio.gather(*(w.send(snap) for w in clients))
-
-async def game_tick():
+async def tick(app):
     while True:
-        now = time.time()
-        for pid,p in list(players.items()):
-            if now - p.last_active > AFK_LIMIT:
-                await kick(pid,"AFK")
-        for fb in fireballs[:]:
-            fb["x"] += fb["vx"]; fb["y"] += fb["vy"]
-            out = (fb["x"]<-FIREBALL_R or fb["x"]>800+FIREBALL_R or
-                   fb["y"]<-FIREBALL_R or fb["y"]>600+FIREBALL_R)
-            if out or not passable(fb["x"],fb["y"],FIREBALL_R):
-                fireballs.remove(fb); continue
-            for p in list(players.values()):
-                if p.id==fb["owner"]: continue
-                if (fb["x"]-p.x)**2+(fb["y"]-p.y)**2 <= (PLAYER_R+FIREBALL_R)**2:
-                    p.hp-=1; fireballs.remove(fb); p.touch()
-                    if p.hp<=0: await kick(p.id,"DEAD")
-                    break
-        await broadcast()
-        await asyncio.sleep(TICK)
+        await asyncio.sleep(1/FPS)
+        for r in rooms.values():
+            r.update()
+            st = r.dump()
+            for s in set(r.sockets):
+                await s.send_json(st)
 
-async def kick(pid,reason=""):
-    ws_list = [w for w,uid in clients.items() if uid==pid]
-    if ws_list:
-        try: await ws_list[0].send(json.dumps({"kick":reason}))
-        finally: await ws_list[0].close()
 
-# ── statyczne + router ───────────────────────────────────────────────────
-mimetypes.add_type("application/javascript",".js")
-mimetypes.add_type("text/css",".css")
-async def serve_static(url_path:str):
-    path = urlsplit(url_path).path or "/index.html"
-    if path.endswith("/"): path+="index.html"
-    fp = (ROOT/path.lstrip("/")).resolve()
-    if not fp.exists() or ROOT not in fp.parents:
-        fp = ROOT/"index.html"
-    mime,_ = mimetypes.guess_type(fp.name)
-    mime = (mime or "application/octet-stream")
-    if mime.startswith("text/"): mime+="; charset=utf-8"
-    body = fp.read_bytes()
-    return (HTTPStatus.OK,
-            [("Content-Type",mime),("Content-Length",str(len(body)))],
-            body)
+async def start(app): app['ticker'] = asyncio.create_task(tick(app))
+async def stop(app):  app['ticker'].cancel(); await app['ticker']
 
-async def http_router(path,_):
-    if path=="/ws": return
-    return await serve_static(path)
 
-async def main():
-    async with websockets.serve(ws_handler,"0.0.0.0",PORT,
-                                process_request=http_router,
-                                ping_interval=None):
-        print(f"→ http://localhost:{PORT}")
-        asyncio.create_task(game_tick())
-        await asyncio.Future()
+def create_app():
+    app = web.Application()
+    wd = os.path.join(os.path.dirname(__file__), 'web')
+    app.router.add_static('/assets', path=os.path.join(wd,'assets'), show_index=False)
+    app.router.add_static('/',        path=wd,            show_index=True)
+    app.router.add_get('/ws', ws_handler)
+    app.router.add_get('/rooms', lambda r: web.json_response({'rooms': list(rooms)}))
+    app.on_startup.append(start); app.on_cleanup.append(stop)
+    return app
 
-if __name__=="__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: print("Server stopped.")
+
+if __name__ == '__main__':
+    print(f"Serving on http://{HOST}:{PORT}")
+    web.run_app(create_app(), host=HOST, port=PORT)
