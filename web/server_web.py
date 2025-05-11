@@ -14,8 +14,8 @@ from urllib.parse import urlsplit
 from PIL import Image
 import numpy as np
 
-ROOT       = pathlib.Path(__file__).parent
-PORT       = 8080
+ROOT        = pathlib.Path(__file__).parent
+PORT        = int(os.getenv("PORT", 8080))  # Railway tu ustawia port
 TICK       = 1/30
 AFK_LIMIT  = 60
 PLAYER_R   = 6
